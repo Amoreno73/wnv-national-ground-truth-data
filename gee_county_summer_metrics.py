@@ -282,6 +282,9 @@ def get_summer_ndvi_mean(county_geometry: ee.Geometry, start: ee.Date, end: ee.D
 
 def get_landcover_image(year: int) -> ee.Image:
     """Get MODIS IGBP landcover for a year, fallback to latest if missing."""
+    # LC_Type1 corresponds to:
+    # Annual International Geosphere-Biosphere Programme (IGBP) classification
+    
     collection = ee.ImageCollection(MODIS_LANDCOVER).select("LC_Type1")
     by_year = collection.filter(ee.Filter.calendarRange(year, year, "year")).first()
     latest = collection.sort("system:time_start", False).first()
@@ -292,13 +295,23 @@ def build_ndvi_cover_metrics(year: int, county_geometry: ee.Geometry, ndvi_mean:
     """Mask NDVI by cover classes and return one multi-band image for reduceRegions."""
     lc = get_landcover_image(year)
 
+    # MODIS MCD12Q1 LC_Type1 uses IGBP classes:
+    # see https://developers.google.com/earth-engine/datasets/catalog/MODIS_061_MCD12Q1
+    # 12 = Croplands, 14 = Cropland/Natural Vegetation Mosaic.
     agri = lc.eq(12).Or(lc.eq(14)).selfMask()
 
+    # Forest subclasses:
+    # 1 = Evergreen Needleleaf Forest, 2 = Evergreen Broadleaf Forest,
+    # 3 = Deciduous Needleleaf Forest, 4 = Deciduous Broadleaf Forest,
+    # 5 = Mixed Forests.
     evergreen = lc.eq(1).Or(lc.eq(2)).selfMask()
     deciduous = lc.eq(3).Or(lc.eq(4)).selfMask()
     mixed = lc.eq(5).selfMask()
     forest = evergreen.Or(deciduous).Or(mixed).selfMask()
 
+    # Rangeland proxy from IGBP classes:
+    # 6 = Closed Shrublands, 7 = Open Shrublands, 8 = Woody Savannas,
+    # 9 = Savannas, 10 = Grasslands.
     rangeland = (
         lc.eq(6)  # shrubland
         .Or(lc.eq(7))
@@ -343,6 +356,7 @@ def build_water_metrics(
     water_occurrence_threshold: float,
 ) -> ee.Image:
     """Build summer water-related metrics: LST day/night and chlorophyll-a."""
+    # JRC occurrence is used as an inland/open-surface-water mask in county polygons.
     water_mask = ee.Image(JRC_SURFACE_WATER).select("occurrence").gte(water_occurrence_threshold).selfMask()
 
     lst_collection = (
@@ -351,6 +365,7 @@ def build_water_metrics(
         .filterDate(start, end)
         .select(["LST_Day_1km", "LST_Night_1km"])
     )
+    # MOD11A2 scale factor is 0.02 Kelvin; convert to Celsius for export.
     lst_day_raw = safe_mean_single_band(lst_collection.select("LST_Day_1km"), "LST_Day_1km")
     lst_night_raw = safe_mean_single_band(lst_collection.select("LST_Night_1km"), "LST_Night_1km")
     lst_day_c = lst_day_raw.multiply(0.02).subtract(273.15).rename("water_lst_day_c")
@@ -362,13 +377,16 @@ def build_water_metrics(
         .filterDate(start, end)
         .select("chlor_a")
     )
+    # chlor_a from MODIS-Aqua L3 SMI is a concentration field (mg m^-3).
+    # Keep the dataset's native valid-data mask. Do not apply JRC occurrence here:
+    # JRC surface-water is inland-focused and can mask out coastal/ocean pixels.
     chlor_a = safe_mean_single_band(chlor_a_collection, "water_chlorophyll_a")
 
     return ee.Image.cat(
         [
             lst_day_c.updateMask(water_mask),
             lst_night_c.updateMask(water_mask),
-            chlor_a.updateMask(water_mask),
+            chlor_a,
         ]
     ).clip(county_geometry)
 
@@ -401,6 +419,8 @@ def build_year_metrics(
     def _append_year_and_fill_missing(feature: ee.Feature) -> ee.Feature:
         # Force all metric columns to exist in every row.
         # Missing or null values are filled with -9999 (sentinel) so columns are not dropped.
+        # A value can be missing when a county has no valid pixels for a given metric
+        # (for example no land-cover class pixels, no inland water pixels, or no chlor_a coverage).
         property_names = feature.propertyNames()
 
         def _filled_value(column: str):
@@ -496,7 +516,7 @@ def main() -> None:
     print(f"Description: {export_prefix}")
     print(f"Drive folder: {args.export_folder}")
 
-# in terminal (powershell):
-# python .\gee_county_summer_metrics.py --test-fips 17031 --start-year 2022
+# example usage - in terminal (powershell):
+# python .\gee_county_summer_metrics.py --test-fips 17031, 17019 --start-year 2022
 if __name__ == "__main__":
     main()
