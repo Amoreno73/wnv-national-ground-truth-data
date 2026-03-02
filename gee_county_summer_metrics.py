@@ -31,8 +31,8 @@ MODIS_LANDCOVER = "MODIS/061/MCD12Q1" # ag/forest/rangeland masks
 MODIS_CHLOR_A = "NASA/OCEANDATA/MODIS-Aqua/L3SMI" # mainly ocean/coastal (so inland counties may have no data)
 JRC_SURFACE_WATER = "JRC/GSW1_4/GlobalSurfaceWater" # static water mask
 
-# Metrics we always want present in the output schema (saved CSV output in Google Drive)
-REQUIRED_METRIC_COLUMNS = [
+# Base metric columns (mean values). These names are preserved for backward compatibility.
+BASE_METRIC_COLUMNS = [
     "ndvi_agri_mean",
     "ndvi_forest_mean",
     "ndvi_deciduous_mean",
@@ -42,6 +42,14 @@ REQUIRED_METRIC_COLUMNS = [
     "water_lst_day_c",
     "water_lst_night_c",
     "water_chlorophyll_a",
+]
+
+# Metrics we always want present in the output schema (saved CSV output in Google Drive):
+# each base metric plus explicit min/max companions.
+REQUIRED_METRIC_COLUMNS = [
+    column
+    for base_name in BASE_METRIC_COLUMNS
+    for column in (base_name, f"{base_name}_min", f"{base_name}_max")
 ]
 
 # Explicit export column order to keep schema stable in Drive CSV outputs.
@@ -109,7 +117,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--water-occurrence-threshold",
         type=float,
-        default=10.0,
+        default=10.0, # 10% captures seasonal water layers, 90% would capture permanent ones
         help="JRC water occurrence percent threshold used to define county water mask.",
     )
     parser.add_argument(
@@ -284,7 +292,7 @@ def get_landcover_image(year: int) -> ee.Image:
     """Get MODIS IGBP landcover for a year, fallback to latest if missing."""
     # LC_Type1 corresponds to:
     # Annual International Geosphere-Biosphere Programme (IGBP) classification
-    
+
     collection = ee.ImageCollection(MODIS_LANDCOVER).select("LC_Type1")
     by_year = collection.filter(ee.Filter.calendarRange(year, year, "year")).first()
     latest = collection.sort("system:time_start", False).first()
@@ -357,6 +365,9 @@ def build_water_metrics(
 ) -> ee.Image:
     """Build summer water-related metrics: LST day/night and chlorophyll-a."""
     # JRC occurrence is used as an inland/open-surface-water mask in county polygons.
+    # binary water-only mask to differentiate between water and non-water pixels
+    # thus, no land will be included in LST day and night columns
+    # a lower threshold corresponds to more inclusivity and higher leans towards permanent water bodies
     water_mask = ee.Image(JRC_SURFACE_WATER).select("occurrence").gte(water_occurrence_threshold).selfMask()
 
     lst_collection = (
@@ -371,6 +382,7 @@ def build_water_metrics(
     lst_day_c = lst_day_raw.multiply(0.02).subtract(273.15).rename("water_lst_day_c")
     lst_night_c = lst_night_raw.multiply(0.02).subtract(273.15).rename("water_lst_night_c")
 
+    # https://developers.google.com/earth-engine/datasets/catalog/NASA_OCEANDATA_MODIS-Aqua_L3SMI -> "chlor_a"
     chlor_a_collection = (
         ee.ImageCollection(MODIS_CHLOR_A)
         .filterBounds(county_geometry)
@@ -409,9 +421,15 @@ def build_year_metrics(
 
     metrics_image = ee.Image.cat([ndvi_cover_metrics, water_metrics])
 
+    # Compute mean/min/max for each band in one pass.
+    reducer = ee.Reducer.mean().combine( 
+        reducer2=ee.Reducer.minMax(), # returns "min" and "max"
+        sharedInputs=True,
+    )
+
     reduced = metrics_image.reduceRegions(
         collection=counties,
-        reducer=ee.Reducer.mean(),
+        reducer=reducer,
         scale=scale,
         tileScale=tile_scale,
     )
@@ -423,16 +441,31 @@ def build_year_metrics(
         # (for example no land-cover class pixels, no inland water pixels, or no chlor_a coverage).
         property_names = feature.propertyNames()
 
-        def _filled_value(column: str):
-            has_property = property_names.contains(column)
-            raw_value = feature.get(column)
-            return ee.Algorithms.If(
-                has_property,
-                ee.Algorithms.If(ee.Algorithms.IsEqual(raw_value, None), -9999, raw_value),
-                -9999,
-            )
+        def _filled_value_from_candidates(candidates: list[str]):
+            value = -9999
+            for candidate in candidates:
+                has_property = property_names.contains(candidate)
+                raw_value = feature.get(candidate)
+                value = ee.Algorithms.If(
+                    has_property,
+                    ee.Algorithms.If(ee.Algorithms.IsEqual(raw_value, None), -9999, raw_value),
+                    value,
+                )
+            return value
 
-        filled_metrics = {column: _filled_value(column) for column in REQUIRED_METRIC_COLUMNS}
+        filled_metrics = {}
+        for base_name in BASE_METRIC_COLUMNS:
+            # Combined reducers usually emit "<band>_mean", "<band>_min", "<band>_max".
+            # Keep backward-compatible mean column names while also writing min/max columns.
+            filled_metrics[base_name] = _filled_value_from_candidates(
+                [base_name, f"{base_name}_mean"]
+            )
+            filled_metrics[f"{base_name}_min"] = _filled_value_from_candidates(
+                [f"{base_name}_min"]
+            )
+            filled_metrics[f"{base_name}_max"] = _filled_value_from_candidates(
+                [f"{base_name}_max"]
+            )
 
         geoid = ee.String(feature.get(fips_property))
         return feature.set(filled_metrics).set({"GEOID": geoid, "year": year})
@@ -517,6 +550,6 @@ def main() -> None:
     print(f"Drive folder: {args.export_folder}")
 
 # example usage - in terminal (powershell):
-# python .\gee_county_summer_metrics.py --test-fips 17031, 17019 --start-year 2022
+# python .\gee_county_summer_metrics.py --test-fips 17031, 17019 --start-year 2022 --end-year 2022
 if __name__ == "__main__":
     main()
