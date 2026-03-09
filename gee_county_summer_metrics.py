@@ -3,21 +3,16 @@ from __future__ import annotations
 import argparse
 from typing import Iterable, Optional
 
-import ee # RUN THIS IN THE TERMINAL first to connect google account: earthengine authenticate
+# run this command in the terminal to connect google account --> earthengine authenticate
+import ee 
 
 # Context: parameters relevant to the propagation of the West Nile Virus.
-
 # Years: 2017 to 2024
-
 # Months: July to September
-
 # Aggregation: yearly mean (July to September only for each year).
-
-# Parameters - obtainable through GEE: 
-# * Water -> Land Surface Temperature Day, Land Surface Temperature Night, Chlorophyll
-# * NDVI (mean) -> Agricultural (or croplands/farmlands), Forested land cover (Deciduous forest, Evergreen forest, Mixed forest), Rangeland (Grassland, Shrubland, Pasture, Natural grazing land) 
-
 # Region: County-level in the United States.
+# Parameters: 
+# NDVI (Agricultural, Forest, Rangeland), NDCI, LST day/night, Temp, Precipitation, Humidity, Wind speeds
 
 # this is under "users/angel314/"
 GEE_PROJECT="wnv-embeddings"
@@ -25,11 +20,16 @@ GEE_PROJECT="wnv-embeddings"
 # Satellite/image datasets used by this workflow.
 LANDSAT_8_L2 = "LANDSAT/LC08/C02/T1_L2" # ndvi
 LANDSAT_9_L2 = "LANDSAT/LC09/C02/T1_L2" # ndvi
-SENTINEL2_SR = "COPERNICUS/S2_SR_HARMONIZED" # ndvi
+SENTINEL2_SR = "COPERNICUS/S2_SR_HARMONIZED" # ndvi and ndci
 MODIS_LST = "MODIS/061/MOD11A2" # LST day and night 1km
 MODIS_LANDCOVER = "MODIS/061/MCD12Q1" # ag/forest/rangeland masks
-MODIS_CHLOR_A = "NASA/OCEANDATA/MODIS-Aqua/L3SMI" # mainly ocean/coastal (so inland counties may have no data)
+# ^ yearly resets last updated 2024
+
 JRC_SURFACE_WATER = "JRC/GSW1_4/GlobalSurfaceWater" # static water mask
+
+# new for climate data - mean/min/max 
+DAYMET_CLIMATE = "NASA/ORNL/DAYMET_V4" # temperatures and precipitation
+ERA5_LAND_MONTHLY = "ECMWF/ERA5_LAND/MONTHLY_AGGR" # rel. humidity (from temp & pressure), v & u wind speeds 
 
 # Base metric columns (mean values). These names are preserved for backward compatibility.
 BASE_METRIC_COLUMNS = [
@@ -42,6 +42,17 @@ BASE_METRIC_COLUMNS = [
     "water_lst_day_c",
     "water_lst_night_c",
     "water_chlorophyll_a",
+    "daymet_temp_c",
+    "daymet_prcp_mm",
+    "era5_rh_mean_pct",
+    "era5_rh_min_pct",
+    "era5_rh_max_pct",
+    "era5_u10_mean_m_s",
+    "era5_u10_min_m_s",
+    "era5_u10_max_m_s",
+    "era5_v10_mean_m_s",
+    "era5_v10_min_m_s",
+    "era5_v10_max_m_s",
 ]
 
 # Metrics we always want present in the output schema (saved CSV output in Google Drive):
@@ -263,6 +274,24 @@ def mask_sentinel2_sr(image: ee.Image) -> ee.Image:
     return ndvi.updateMask(cloud_mask).updateMask(scl_mask).copyProperties(image, ["system:time_start"])
 
 
+def mask_sentinel2_ndci(image: ee.Image) -> ee.Image:
+    """Mask clouds/cirrus and compute NDCI from Sentinel-2: (B5 - B4) / (B5 + B4)."""
+    qa60 = image.select("QA60")
+    cloud_mask = qa60.bitwiseAnd(1 << 10).eq(0).And(qa60.bitwiseAnd(1 << 11).eq(0))
+
+    scl = image.select("SCL")
+    scl_mask = (
+        scl.neq(3)  # cloud shadow
+        .And(scl.neq(8))  # cloud medium probability
+        .And(scl.neq(9))  # cloud high probability
+        .And(scl.neq(10))  # cirrus
+        .And(scl.neq(11))  # snow/ice
+    )
+
+    ndci = image.normalizedDifference(["B5", "B4"]).rename("water_chlorophyll_a")
+    return ndci.updateMask(cloud_mask).updateMask(scl_mask).copyProperties(image, ["system:time_start"])
+
+
 def get_summer_ndvi_mean(county_geometry: ee.Geometry, start: ee.Date, end: ee.Date) -> ee.Image:
     """Create one summer NDVI mean image from Landsat 8/9 and Sentinel-2."""
     l8_ndvi = (
@@ -286,6 +315,99 @@ def get_summer_ndvi_mean(county_geometry: ee.Geometry, start: ee.Date, end: ee.D
 
     ndvi_collection = l8_ndvi.merge(l9_ndvi).merge(s2_ndvi)
     return safe_mean_single_band(ndvi_collection, "ndvi")
+
+
+def daymet_daily_mean_temp(image: ee.Image) -> ee.Image:
+    """Build one daily mean temperature band in Celsius from DAYMET tmin/tmax."""
+    tmean = image.select("tmin").add(image.select("tmax")).divide(2).rename("daymet_temp_c")
+    return tmean.copyProperties(image, ["system:time_start"])
+
+
+def build_daymet_metrics(county_geometry: ee.Geometry, start: ee.Date, end: ee.Date) -> ee.Image:
+    """Build summer DAYMET metrics: mean daily temperature and mean daily precipitation."""
+    daymet_collection = (
+        ee.ImageCollection(DAYMET_CLIMATE)
+        .filterBounds(county_geometry)
+        .filterDate(start, end)
+    )
+
+    # Temperature in DAYMET is already in Celsius. We compute daily mean temp as (tmin + tmax) / 2,
+    # then take the July-Sep mean image for county reduction.
+    temp_collection = daymet_collection.map(daymet_daily_mean_temp)
+    daymet_temp_c = safe_mean_single_band(temp_collection, "daymet_temp_c")
+
+    # DAYMET prcp is daily precipitation (mm/day). We use the July-Sep mean image.
+    daymet_prcp_mm = safe_mean_single_band(daymet_collection.select("prcp"), "daymet_prcp_mm")
+
+    return ee.Image.cat([daymet_temp_c, daymet_prcp_mm]).clip(county_geometry)
+
+
+def relative_humidity_from_t_and_td(temp_k: ee.Image, dewpoint_k: ee.Image, output_name: str) -> ee.Image:
+    """Compute RH (%) from air temperature and dewpoint temperature, both in Kelvin."""
+    temp_c = temp_k.subtract(273.15)
+    dewpoint_c = dewpoint_k.subtract(273.15)
+
+    # Magnus approximation; RH = 100 * exp(gamma(Td) - gamma(T))
+    gamma_td = dewpoint_c.multiply(17.625).divide(dewpoint_c.add(243.04))
+    gamma_t = temp_c.multiply(17.625).divide(temp_c.add(243.04))
+    return gamma_td.subtract(gamma_t).exp().multiply(100).clamp(0, 100).rename(output_name)
+
+
+def build_era5_metrics(county_geometry: ee.Geometry, start: ee.Date, end: ee.Date) -> ee.Image:
+    """Build Jul-Sep ERA5-Land metrics: RH and 10m u/v wind components (mean/min/max bands)."""
+    era5_collection = (
+        ee.ImageCollection(ERA5_LAND_MONTHLY)
+        .filterBounds(county_geometry)
+        .filterDate(start, end)
+    )
+
+    rh_mean_collection = era5_collection.map(
+        lambda image: relative_humidity_from_t_and_td(
+            image.select("temperature_2m"),
+            image.select("dewpoint_temperature_2m"),
+            "era5_rh_mean_pct",
+        ).copyProperties(image, ["system:time_start"])
+    )
+    rh_min_collection = era5_collection.map(
+        lambda image: relative_humidity_from_t_and_td(
+            image.select("temperature_2m_min"),
+            image.select("dewpoint_temperature_2m_min"),
+            "era5_rh_min_pct",
+        ).copyProperties(image, ["system:time_start"])
+    )
+    rh_max_collection = era5_collection.map(
+        lambda image: relative_humidity_from_t_and_td(
+            image.select("temperature_2m_max"),
+            image.select("dewpoint_temperature_2m_max"),
+            "era5_rh_max_pct",
+        ).copyProperties(image, ["system:time_start"])
+    )
+
+    era5_rh_mean = safe_mean_single_band(rh_mean_collection, "era5_rh_mean_pct")
+    era5_rh_min = safe_mean_single_band(rh_min_collection, "era5_rh_min_pct")
+    era5_rh_max = safe_mean_single_band(rh_max_collection, "era5_rh_max_pct")
+
+    # Monthly mean/min/max wind component bands are provided directly in ERA5-Land monthly_aggr.
+    era5_u10_mean = safe_mean_single_band(era5_collection.select("u_component_of_wind_10m"), "era5_u10_mean_m_s")
+    era5_u10_min = safe_mean_single_band(era5_collection.select("u_component_of_wind_10m_min"), "era5_u10_min_m_s")
+    era5_u10_max = safe_mean_single_band(era5_collection.select("u_component_of_wind_10m_max"), "era5_u10_max_m_s")
+    era5_v10_mean = safe_mean_single_band(era5_collection.select("v_component_of_wind_10m"), "era5_v10_mean_m_s")
+    era5_v10_min = safe_mean_single_band(era5_collection.select("v_component_of_wind_10m_min"), "era5_v10_min_m_s")
+    era5_v10_max = safe_mean_single_band(era5_collection.select("v_component_of_wind_10m_max"), "era5_v10_max_m_s")
+
+    return ee.Image.cat(
+        [
+            era5_rh_mean,
+            era5_rh_min,
+            era5_rh_max,
+            era5_u10_mean,
+            era5_u10_min,
+            era5_u10_max,
+            era5_v10_mean,
+            era5_v10_min,
+            era5_v10_max,
+        ]
+    ).clip(county_geometry)
 
 
 def get_landcover_image(year: int) -> ee.Image:
@@ -363,7 +485,7 @@ def build_water_metrics(
     end: ee.Date,
     water_occurrence_threshold: float,
 ) -> ee.Image:
-    """Build summer water-related metrics: LST day/night and chlorophyll-a."""
+    """Build summer water-related metrics: LST day/night and chlorophyll proxy from Sentinel-2 NDCI."""
     # JRC occurrence is used as an inland/open-surface-water mask in county polygons.
     # binary water-only mask to differentiate between water and non-water pixels
     # thus, no land will be included in LST day and night columns
@@ -382,23 +504,21 @@ def build_water_metrics(
     lst_day_c = lst_day_raw.multiply(0.02).subtract(273.15).rename("water_lst_day_c")
     lst_night_c = lst_night_raw.multiply(0.02).subtract(273.15).rename("water_lst_night_c")
 
-    # https://developers.google.com/earth-engine/datasets/catalog/NASA_OCEANDATA_MODIS-Aqua_L3SMI -> "chlor_a"
-    chlor_a_collection = (
-        ee.ImageCollection(MODIS_CHLOR_A)
+    # Chlorophyll estimation from Sentinel-2 NDCI:
+    # NDCI = (B5 - B4) / (B5 + B4), computed per image then summer-averaged.
+    ndci_collection = (
+        ee.ImageCollection(SENTINEL2_SR)
         .filterBounds(county_geometry)
         .filterDate(start, end)
-        .select("chlor_a")
+        .map(mask_sentinel2_ndci)
     )
-    # chlor_a from MODIS-Aqua L3 SMI is a concentration field (mg m^-3).
-    # Keep the dataset's native valid-data mask. Do not apply JRC occurrence here:
-    # JRC surface-water is inland-focused and can mask out coastal/ocean pixels.
-    chlor_a = safe_mean_single_band(chlor_a_collection, "water_chlorophyll_a")
+    ndci_mean = safe_mean_single_band(ndci_collection, "water_chlorophyll_a")
 
     return ee.Image.cat(
         [
             lst_day_c.updateMask(water_mask),
             lst_night_c.updateMask(water_mask),
-            chlor_a,
+            ndci_mean.updateMask(water_mask),
         ]
     ).clip(county_geometry)
 
@@ -418,8 +538,10 @@ def build_year_metrics(
     ndvi_mean = get_summer_ndvi_mean(county_geometry, start, end)
     ndvi_cover_metrics = build_ndvi_cover_metrics(year, county_geometry, ndvi_mean)
     water_metrics = build_water_metrics(county_geometry, start, end, water_occurrence_threshold)
+    daymet_metrics = build_daymet_metrics(county_geometry, start, end)
+    era5_metrics = build_era5_metrics(county_geometry, start, end)
 
-    metrics_image = ee.Image.cat([ndvi_cover_metrics, water_metrics])
+    metrics_image = ee.Image.cat([ndvi_cover_metrics, water_metrics, daymet_metrics, era5_metrics])
 
     # Compute mean/min/max for each band in one pass.
     reducer = ee.Reducer.mean().combine( 
@@ -438,7 +560,8 @@ def build_year_metrics(
         # Force all metric columns to exist in every row.
         # Missing or null values are filled with -9999 (sentinel) so columns are not dropped.
         # A value can be missing when a county has no valid pixels for a given metric
-        # (for example no land-cover class pixels, no inland water pixels, or no chlor_a coverage).
+        # (for example no land-cover class pixels, no inland water pixels, no NDCI coverage,
+        # no DAYMET pixels after masking/filtering, or no ERA5 monthly coverage).
         property_names = feature.propertyNames()
 
         def _filled_value_from_candidates(candidates: list[str]):
