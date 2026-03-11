@@ -118,7 +118,7 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument(
-        "--county-asset-id",
+        "--county-asset-id", # CUSTOM ASSET v
         default="projects/wnv-embeddings/assets/tl_2025_us_county", # this is the same asset used for the 2025 county boundary embedding calculations
         help="GEE FeatureCollection asset with county boundaries and FIPS property.",
     )
@@ -676,3 +676,9 @@ def main() -> None:
 # python .\gee_county_summer_metrics.py --test-fips 17031, 17019 --start-year 2022 --end-year 2022
 if __name__ == "__main__":
     main()
+
+# powershell - to begin tasks for one year at a time to play it safe (incase 8 years at once fails).
+#     2017..2024 | ForEach-Object {
+#   python .\gee_county_summer_metrics.py --start-year $_ --end-year $_ --export-prefix "county_summer_metrics_$($_)"
+# }
+
