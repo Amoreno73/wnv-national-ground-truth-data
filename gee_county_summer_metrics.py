@@ -9,10 +9,14 @@ import ee
 # Context: parameters relevant to the propagation of the West Nile Virus.
 # Years: 2017 to 2024
 # Months: July to September
-# Aggregation: yearly mean (July to September only for each year).
+# Aggregation: yearly mean (July to September only for each year) + min/max for select metrics.
 # Region: County-level in the United States.
-# Parameters: 
-# NDVI (Agricultural, Forest, Rangeland), NDCI, LST day/night, Temp, Precipitation, Humidity, Wind speeds
+
+# ================== All Parameters ==================
+# NDVI (Agricultural, Forest, Rangeland, Urban, Suburban, Rural), NDCI, 
+# LST Day/Night, Temperature, Precipitation, Humidity, Wind speeds, 
+# Population density, Wetland, distance to water bodies, Bird Migration intensity
+# ================================================
 
 # this is under "users/angel314/"
 GEE_PROJECT="wnv-embeddings"
@@ -23,11 +27,7 @@ LANDSAT_9_L2 = "LANDSAT/LC09/C02/T1_L2" # ndvi
 SENTINEL2_SR = "COPERNICUS/S2_SR_HARMONIZED" # ndvi and ndci
 MODIS_LST = "MODIS/061/MOD11A2" # LST day and night 1km
 MODIS_LANDCOVER = "MODIS/061/MCD12Q1" # ag/forest/rangeland masks
-# ^ yearly resets last updated 2024
-
 JRC_SURFACE_WATER = "JRC/GSW1_4/GlobalSurfaceWater" # static water mask
-
-# new for climate data - mean/min/max 
 DAYMET_CLIMATE = "NASA/ORNL/DAYMET_V4" # temperatures and precipitation
 ERA5_LAND_MONTHLY = "ECMWF/ERA5_LAND/MONTHLY_AGGR" # rel. humidity (from temp & pressure), v & u wind speeds 
 
@@ -45,14 +45,9 @@ BASE_METRIC_COLUMNS = [
     "daymet_temp_c",
     "daymet_prcp_mm",
     "era5_rh_mean_pct",
-    "era5_rh_min_pct",
-    "era5_rh_max_pct",
     "era5_u10_mean_m_s",
-    "era5_u10_min_m_s",
-    "era5_u10_max_m_s",
     "era5_v10_mean_m_s",
-    "era5_v10_min_m_s",
-    "era5_v10_max_m_s",
+    "distance_to_water_m"
 ]
 
 # Metrics we always want present in the output schema (saved CSV output in Google Drive):
@@ -65,25 +60,25 @@ REQUIRED_METRIC_COLUMNS = [
 
 # Explicit export column order to keep schema stable in Drive CSV outputs.
 EXPORT_BASE_COLUMNS = [
-    "system:index",
-    "ALAND",
-    "AWATER",
-    "CBSAFP",
-    "CLASSFP",
-    "COUNTYFP",
-    "COUNTYNS",
-    "CSAFP",
-    "FUNCSTAT",
-    "GEOID",
-    "GEOIDFQ",
-    "INTPTLAT",
-    "INTPTLON",
-    "LSAD",
-    "METDIVFP",
-    "MTFCC",
-    "NAME",
-    "NAMELSAD",
-    "STATEFP",
+    "system:index", # index
+    "ALAND", # area meters^2
+    "AWATER", # area meters^2
+    "CBSAFP", # Core Based Statistical Areas
+    "CLASSFP", # distinguish between different types of geographic entities in census data
+    "COUNTYFP", # county FIPS code
+    "COUNTYNS", # National Standards (NS) codes
+    "CSAFP", # Combined Statistical Area FIPS code
+    "FUNCSTAT", # legal or operational status of a geographic entity
+    "GEOID", # geographic identifier
+    "GEOIDFQ", # Fully Qualified Geographic Identifier
+    "INTPTLAT", # internal point latitude
+    "INTPTLON", # internal point longitude
+    "LSAD", # Legal/Statistical Area Description
+    "METDIVFP", # Current metropolitan division code
+    "MTFCC", # MAF/TIGER feature class code
+    "NAME", # current county name 
+    "NAMELSAD", # name + translated legal/statistical area description for county
+    "STATEFP", # state FIPS code
 ]
 
 def validate_project_id(project: Optional[str]) -> Optional[str]:
@@ -319,7 +314,7 @@ def get_summer_ndvi_mean(county_geometry: ee.Geometry, start: ee.Date, end: ee.D
 
 def daymet_daily_mean_temp(image: ee.Image) -> ee.Image:
     """Build one daily mean temperature band in Celsius from DAYMET tmin/tmax."""
-    tmean = image.select("tmin").add(image.select("tmax")).divide(2).rename("daymet_temp_c")
+    tmean = image.select("tmin").add(image.select("tmax")).divide(2).rename("daymet_temp_c") # daymet_temp_c = mean calculation
     return tmean.copyProperties(image, ["system:time_start"])
 
 
@@ -411,7 +406,7 @@ def build_era5_metrics(county_geometry: ee.Geometry, start: ee.Date, end: ee.Dat
 
 
 def get_landcover_image(year: int) -> ee.Image:
-    """Get MODIS IGBP landcover for a year, fallback to latest if missing."""
+    """Get MODIS IGBP landcover for a year, fallback to latest if missing (only updated first day of the year)."""
     # LC_Type1 corresponds to:
     # Annual International Geosphere-Biosphere Programme (IGBP) classification
 
@@ -492,6 +487,11 @@ def build_water_metrics(
     # a lower threshold corresponds to more inclusivity and higher leans towards permanent water bodies
     water_mask = ee.Image(JRC_SURFACE_WATER).select("occurrence").gte(water_occurrence_threshold).selfMask()
 
+    distance_to_water_m = water_mask.distance(
+        ee.Kernel.euclidean(100_000, "meters"), # max radius in meters to search for waterbody
+        skipMasked=False
+    ).rename("distance_to_water_m") 
+
     lst_collection = (
         ee.ImageCollection(MODIS_LST)
         .filterBounds(county_geometry)
@@ -519,6 +519,7 @@ def build_water_metrics(
             lst_day_c.updateMask(water_mask),
             lst_night_c.updateMask(water_mask),
             ndci_mean.updateMask(water_mask),
+            distance_to_water_m
         ]
     ).clip(county_geometry)
 
@@ -541,7 +542,7 @@ def build_year_metrics(
     daymet_metrics = build_daymet_metrics(county_geometry, start, end)
     era5_metrics = build_era5_metrics(county_geometry, start, end)
 
-    metrics_image = ee.Image.cat([ndvi_cover_metrics, water_metrics, daymet_metrics, era5_metrics])
+    metrics_image = ee.Image.cat([ndvi_cover_metrics, water_metrics, distance_to_water_m, daymet_metrics, era5_metrics])
 
     # Compute mean/min/max for each band in one pass.
     reducer = ee.Reducer.mean().combine( 
