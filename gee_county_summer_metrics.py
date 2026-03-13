@@ -13,7 +13,7 @@ import ee
 # Region: County-level in the United States.
 
 # ================== All Parameters ==================
-# NDVI (Agricultural, Forest, Rangeland, Urban, Suburban, Rural), NDCI, 
+# NDVI (Agricultural, Forest, Rangeland, Urban), NDCI, 
 # LST Day/Night, Temperature, Precipitation, Humidity, Wind speeds, 
 # Population density, Wetland, distance to water bodies, Bird Migration intensity
 # ================================================
@@ -30,15 +30,21 @@ MODIS_LANDCOVER = "MODIS/061/MCD12Q1" # ag/forest/rangeland masks
 JRC_SURFACE_WATER = "JRC/GSW1_4/GlobalSurfaceWater" # static water mask
 DAYMET_CLIMATE = "NASA/ORNL/DAYMET_V4" # temperatures and precipitation
 ERA5_LAND_MONTHLY = "ECMWF/ERA5_LAND/MONTHLY_AGGR" # rel. humidity (from temp & pressure), v & u wind speeds 
+GHSL_URBAN = "JRC/GHSL/P2023A/GHS_SMOD_V2-0" # urban/suburban/rural classes
+# will handle population density using past DataCommons API script.
 
-# Base metric columns (mean values). These names are preserved for backward compatibility.
-BASE_METRIC_COLUMNS = [
+# Metrics that should include mean/min/max outputs.
+METRICS_WITH_MINMAX = [
     "ndvi_agri_mean",
     "ndvi_forest_mean",
     "ndvi_deciduous_mean",
     "ndvi_evergreen_mean",
     "ndvi_mixed_mean",
     "ndvi_rangeland_mean",
+    "ndvi_rural_mean",
+    "ndvi_suburban_mean",
+    "ndvi_urban_mean",
+    "wetland_mean",
     "water_lst_day_c",
     "water_lst_night_c",
     "water_chlorophyll_a",
@@ -47,16 +53,20 @@ BASE_METRIC_COLUMNS = [
     "era5_rh_mean_pct",
     "era5_u10_mean_m_s",
     "era5_v10_mean_m_s",
-    "distance_to_water_m"
+]
+
+# Metrics that should include only a single mean value.
+SINGLE_METRIC_COLUMNS = [
+    "distance_to_water_m",
 ]
 
 # Metrics we always want present in the output schema (saved CSV output in Google Drive):
-# each base metric plus explicit min/max companions.
+# each base metric plus explicit min/max companions (for metrics in METRICS_WITH_MINMAX only).
 REQUIRED_METRIC_COLUMNS = [
     column
-    for base_name in BASE_METRIC_COLUMNS
+    for base_name in METRICS_WITH_MINMAX
     for column in (base_name, f"{base_name}_min", f"{base_name}_max")
-]
+] + SINGLE_METRIC_COLUMNS
 
 # Explicit export column order to keep schema stable in Drive CSV outputs.
 EXPORT_BASE_COLUMNS = [
@@ -113,7 +123,7 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument(
-        "--county-asset-id", # CUSTOM ASSET v
+        "--county-asset-id", # CUSTOM ASSET below used for county boundaries
         default="projects/wnv-embeddings/assets/tl_2025_us_county", # this is the same asset used for the 2025 county boundary embedding calculations
         help="GEE FeatureCollection asset with county boundaries and FIPS property.",
     )
@@ -155,7 +165,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--scale",
         type=int,
-        default=1000,
+        default=1000, # reduceRegions summarizes data on a 1 km resolution basis
         help="Reduction scale in meters for county means.",
     )
     parser.add_argument(
@@ -416,14 +426,32 @@ def get_landcover_image(year: int) -> ee.Image:
     return ee.Image(ee.Algorithms.If(by_year, by_year, latest))
 
 
+def get_landcover_prop3_image(year: int) -> ee.Image:
+    """Get MODIS landcover LC_Prop3 for a year, fallback to latest if missing."""
+    collection = ee.ImageCollection(MODIS_LANDCOVER).select("LC_Prop3")
+    by_year = collection.filter(ee.Filter.calendarRange(year, year, "year")).first()
+    latest = collection.sort("system:time_start", False).first()
+    return ee.Image(ee.Algorithms.If(by_year, by_year, latest))
+
+
 def build_ndvi_cover_metrics(year: int, county_geometry: ee.Geometry, ndvi_mean: ee.Image) -> ee.Image:
     """Mask NDVI by cover classes and return one multi-band image for reduceRegions."""
     lc = get_landcover_image(year)
+    lc_prop3 = get_landcover_prop3_image(year)
 
     # MODIS MCD12Q1 LC_Type1 uses IGBP classes:
     # see https://developers.google.com/earth-engine/datasets/catalog/MODIS_061_MCD12Q1
     # 12 = Croplands, 14 = Cropland/Natural Vegetation Mosaic.
     agri = lc.eq(12).Or(lc.eq(14)).selfMask()
+    # GHSL SMOD L2 classes for urbanization:
+    # see https://developers.google.com/earth-engine/datasets/catalog/JRC_GHSL_P2023A_GHS_SMOD_V2-0 
+    # 11/12/13 = rural
+    # 21 = suburban/peri-urban
+    # 22/23/30 = urban clusters/centres.
+    ghsl = ee.ImageCollection(GHSL_URBAN).select("smod_code").mosaic()
+    rural = ghsl.eq(11).Or(ghsl.eq(12)).Or(ghsl.eq(13)).selfMask()
+    suburban = ghsl.eq(21).selfMask()
+    urban = ghsl.eq(22).Or(ghsl.eq(23)).Or(ghsl.eq(30)).selfMask()
 
     # Forest subclasses:
     # 1 = Evergreen Needleleaf Forest, 2 = Evergreen Broadleaf Forest,
@@ -446,6 +474,11 @@ def build_ndvi_cover_metrics(year: int, county_geometry: ee.Geometry, ndvi_mean:
         .selfMask()
     )
 
+    # Wetlands consolidation:
+    # LC_Type1: 11 = Permanent Wetlands
+    # LC_Prop3: 27 = Woody Wetlands, 50 = Herbaceous Wetlands
+    wetlands = lc.eq(11).Or(lc_prop3.eq(27)).Or(lc_prop3.eq(50)).selfMask()
+
     # Reproject masks to NDVI projection so masking is spatially consistent.
     ndvi_projection = ndvi_mean.projection()
     agri = agri.reproject(ndvi_projection)
@@ -454,6 +487,7 @@ def build_ndvi_cover_metrics(year: int, county_geometry: ee.Geometry, ndvi_mean:
     mixed = mixed.reproject(ndvi_projection)
     forest = forest.reproject(ndvi_projection)
     rangeland = rangeland.reproject(ndvi_projection)
+    wetlands = wetlands.reproject(ndvi_projection)
 
     ndvi_agri = ndvi_mean.updateMask(agri).rename("ndvi_agri_mean")
     ndvi_forest = ndvi_mean.updateMask(forest).rename("ndvi_forest_mean")
@@ -461,6 +495,10 @@ def build_ndvi_cover_metrics(year: int, county_geometry: ee.Geometry, ndvi_mean:
     ndvi_evergreen = ndvi_mean.updateMask(evergreen).rename("ndvi_evergreen_mean")
     ndvi_mixed = ndvi_mean.updateMask(mixed).rename("ndvi_mixed_mean")
     ndvi_range = ndvi_mean.updateMask(rangeland).rename("ndvi_rangeland_mean")
+    ndvi_rural = ndvi_mean.updateMask(rural).rename("ndvi_rural_mean")
+    ndvi_suburban = ndvi_mean.updateMask(suburban).rename("ndvi_suburban_mean")
+    ndvi_urban = ndvi_mean.updateMask(urban).rename("ndvi_urban_mean")
+    ndvi_wetlands = ndvi_mean.updateMask(wetlands).rename("wetland_mean")
 
     return ee.Image.cat(
         [
@@ -470,6 +508,10 @@ def build_ndvi_cover_metrics(year: int, county_geometry: ee.Geometry, ndvi_mean:
             ndvi_evergreen,
             ndvi_mixed,
             ndvi_range,
+            ndvi_rural,
+            ndvi_suburban,
+            ndvi_urban,
+            ndvi_wetlands,
         ]
     ).clip(county_geometry)
 
@@ -541,12 +583,14 @@ def build_year_metrics(
     water_metrics = build_water_metrics(county_geometry, start, end, water_occurrence_threshold)
     daymet_metrics = build_daymet_metrics(county_geometry, start, end)
     era5_metrics = build_era5_metrics(county_geometry, start, end)
-
-    metrics_image = ee.Image.cat([ndvi_cover_metrics, water_metrics, distance_to_water_m, daymet_metrics, era5_metrics])
+    metrics_image = ee.Image.cat([ndvi_cover_metrics, water_metrics, daymet_metrics, era5_metrics])
 
     # Compute mean/min/max for each band in one pass.
-    reducer = ee.Reducer.mean().combine( 
+    reducer = ee.Reducer.mean().combine(
         reducer2=ee.Reducer.minMax(), # returns "min" and "max"
+        sharedInputs=True,
+    ).combine(
+        reducer2=ee.Reducer.sum(), # used for population count
         sharedInputs=True,
     )
 
@@ -578,7 +622,7 @@ def build_year_metrics(
             return value
 
         filled_metrics = {}
-        for base_name in BASE_METRIC_COLUMNS:
+        for base_name in METRICS_WITH_MINMAX:
             # Combined reducers usually emit "<band>_mean", "<band>_min", "<band>_max".
             # Keep backward-compatible mean column names while also writing min/max columns.
             filled_metrics[base_name] = _filled_value_from_candidates(
@@ -589,6 +633,11 @@ def build_year_metrics(
             )
             filled_metrics[f"{base_name}_max"] = _filled_value_from_candidates(
                 [f"{base_name}_max"]
+            )
+
+        for base_name in SINGLE_METRIC_COLUMNS:
+            filled_metrics[base_name] = _filled_value_from_candidates(
+                [base_name, f"{base_name}_mean"]
             )
 
         geoid = ee.String(feature.get(fips_property))
@@ -673,13 +722,13 @@ def main() -> None:
     print(f"Description: {export_prefix}")
     print(f"Drive folder: {args.export_folder}")
 
-# example usage - in terminal (powershell):
-# python .\gee_county_summer_metrics.py --test-fips 17031, 17019 --start-year 2022 --end-year 2022
+# powershell - example usage:
+# python .\gee_county_summer_metrics.py --test-fips 17031,17019 --start-year 2022 --end-year 2022 --export-prefix "test_2022"
 if __name__ == "__main__":
     main()
 
-# powershell - to begin tasks for one year at a time to play it safe (incase 8 years at once fails).
-#     2017..2024 | ForEach-Object {
+# powershell - TO RUN ALL YEARS, ONE AT A TIME:
+# 2017..2024 | ForEach-Object {
 #   python .\gee_county_summer_metrics.py --start-year $_ --end-year $_ --export-prefix "county_summer_metrics_$($_)"
 # }
 

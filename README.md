@@ -12,6 +12,10 @@
   - `ndvi_evergreen_mean`
   - `ndvi_mixed_mean`
   - `ndvi_rangeland_mean`
+- Computes NDVI by GHSL settlement classes (GHS-SMOD v2.0):
+  - `ndvi_rural_mean` (classes `11/12/13`)
+  - `ndvi_suburban_mean` (class `21`)
+  - `ndvi_urban_mean` (classes `22/23/30`)
 - Computes water metrics:
   - `water_lst_day_c` and `water_lst_night_c` from MODIS LST, masked to JRC surface-water occurrence threshold.
   - `water_chlorophyll_a` as Sentinel-2 NDCI, where `NDCI = (B5 - B4) / (B5 + B4)`, masked to JRC surface-water occurrence threshold.
